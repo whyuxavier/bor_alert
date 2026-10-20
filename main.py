@@ -1,456 +1,278 @@
-#бот працює на сервері Oracle тому містить шлях до файлів які лежать там
+# Бориспіль | Монітор
 import asyncio
-import aiohttp
 import json
 import os
 import re
-
-from telethon import TelegramClient, events
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# API
-api_id = 123456
-api_hash = "ваш_ір"
-alerts_token = "ваш_ір"
+import aiohttp
+from dotenv import load_dotenv
+from telethon import TelegramClient, events
 
-channels = [
-    "operinform",
-    "war_monitor",
-    "eRadarrua",
-    "kyiv_nebo",
-    "kyiv_airdef",
-]
+load_dotenv()
 
-target_channel = "bor_alert"
-client = TelegramClient("monitor_session", api_id, api_hash)
+# ---------- Налаштування ----------
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+ALERTS_TOKEN = os.environ["ALERTS_TOKEN"]
+TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "bor_alert") 
 
-COOLDOWN = timedelta(seconds=60)
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
-last_message_time = None
-last_alert_status = None
-alert_start_time = None
-boryspil_target_sent = False
+# Папка з сесією та історією тривог (поза репозиторієм)
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+CHANNELS = ["operinform", "war_monitor", "eRadarrua", "kyiv_nebo", "kyiv_airdef"]
 
 BORYSPIL_RAION_UID = "78"
-ALERT_HISTORY_FILE = "/home/opc/alert_history.json"
-channel_link = '<a href="https://t.me/bor_alert">Бориспіль | Монітор</a>'
+ALERT_HISTORY_FILE = os.path.join(DATA_DIR, "alert_history.json")
+POLL_SECONDS = 6
+DEDUP_WINDOW = timedelta(seconds=150)
+
+CHANNEL_LINK = '<a href="https://t.me/bor_alert">Бориспіль | Монітор</a>'
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 BORYSPIL_WORDS = [
-    "бориспіль",
-    "борисполя",
-    "щасливе",
-    "гора",
-    "гору",
-    "дударків",
-    "велика олександрівка",
-    "олександрівка",
-    "баришівка",
-    "баришівку",
-    "рогозів",
-    "вороньків",
+    "бориспіль", "борисполя", "щасливе", "гора", "гору", "дударків",
+    "велика олександрівка", "олександрівка", "баришівка", "баришівку",
+    "рогозів", "вороньків",
 ]
 
 IGNORE_WORDS = [
-    "бориспільський район",
-    "бориспільського району",
-    "бориспільському районі",
-    "бориспільводоканал",
-    "планові роботи",
-    "багринова",
-    "чорна",
-    "батиєва",
+    "бориспільський район", "бориспільського району", "бориспільському районі",
+    "бориспільводоканал", "планові роботи", "багринова", "чорна", "батиєва",
 ]
 
-URGENT_TERMS = [
-    "шахед",
-    "баліст",
-    "ракет",
-    "крилат",
-    "дорозвідка",
-    "пуск",
-    "зліт",
+# Поки вимкнено (разом з обмеженням "більше 20 слів без терміну").
+# URGENT_TERMS = ["шахед", "баліст", "ракет", "крилат", "дорозвідка", "пуск", "зліт"]
+
+DIRECTIONS = {
+    "північ", "півночі", "північний", "північного",
+    "південний", "південь", "півдня", "південного",
+    "схід", "сходу", "східний", "східного",
+    "захід", "заходу", "західний", "західного",
+}
+
+ALERT_TEXT = {
+    "yellow": "<b>🟡 Повітряна тривога!</b>\n<i>Жовтий рівень!</i>",
+    "red": "<b>🔴 Повітряна тривога!</b>\n<i>Червоний рівень!</i>",
+    "active": "<b>🚨 Повітряна тривога!</b>",
+}
+STATUS_TEXT = {
+    "yellow": "🟡 Триває жовта тривога",
+    "red": "🔴 Триває червона тривога",
+    "active": "⚠️ Тривога триває",
+}
+MONTHS = [
+    "січня", "лютого", "березня", "квітня", "травня", "червня",
+    "липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
 ]
 
-DEDUP_WINDOW = timedelta(seconds=150)
-recent_forwarded_messages = []
-message_lock = asyncio.Lock()
+# ---------- Стан ----------
+client = TelegramClient(os.path.join(DATA_DIR, "monitor_session"), API_ID, API_HASH)
 
-
-# Обробка тексту
-def contains_phrase(text, phrase):
-    pattern = r"(?<!\w)" + re.escape(phrase).replace(r"\ ", r"\s+") + r"(?!\w)"
-    return re.search(pattern, text, flags=re.IGNORECASE) is not None
-
-
-def normalize_message(text):
-    text = re.sub(r"@\w+", " ", text.lower())
-    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    return " ".join(text.split())
-
-
-def filter_boryspil_directions(message):
-    lines = [line.strip() for line in message.splitlines() if line.strip()]
-
-    if len(lines) < 2:
-        return message, False
-
-    number_pattern = re.compile(r"^\s*\d+\s+")
-    direction_pattern = re.compile(
-        r"^\s*(?:\d+\s+)?(?:біля|в бік|у бік|на|до|курс(?:ом)?|"
-        r"летить|рухається|напрям(?:ок)?)\b",
-        flags=re.IGNORECASE
-    )
-
-    numbered_lines = sum(bool(number_pattern.search(line)) for line in lines)
-    direction_lines = sum(bool(direction_pattern.search(line)) for line in lines)
-    list_like = numbered_lines >= 2 or direction_lines >= 2
-
-    if not list_like:
-        return message, False
-
-    target_indices = [
-        i for i, line in enumerate(lines)
-        if any(contains_phrase(line, word) for word in BORYSPIL_WORDS)
-    ]
-
-    if not target_indices:
-        return "", True
-
-    first_target_index = target_indices[0]
-    filtered_lines = []
-
-    for i, line in enumerate(lines):
-        if i in target_indices:
-            filtered_lines.append(line)
-        elif i < first_target_index and "київщина" in line.lower():
-            filtered_lines.append(line)
-
-    return "\n".join(filtered_lines), True
-
-
-def is_duplicate_message(text, now):
-    normalized = normalize_message(text)
-    tokens = set(normalized.split())
-
-    if len(tokens) < 3:
-        return False
-
-    directions = {
-        "північ", "півночі", "північний", "північного",
-        "південний", "південь", "півдня", "південного",
-        "схід", "сходу", "східний", "східного",
-        "захід", "заходу", "західний", "західного"
-    }
-    current_directions = tokens & directions
-
-    recent_forwarded_messages[:] = [
-        item for item in recent_forwarded_messages
-        if now - item["time"] <= DEDUP_WINDOW
-    ]
-
-    for item in recent_forwarded_messages:
-        old_tokens = set(item["normalized"].split())
-        old_directions = old_tokens & directions
-
-        if current_directions and old_directions and current_directions != old_directions:
-            continue
-
-        shared = tokens & old_tokens
-        union = tokens | old_tokens
-        similarity = len(shared) / len(union) if union else 0
-
-        if normalized == item["normalized"] or (len(shared) >= 3 and similarity >= 0.72):
-            return True
-
-    return False
+last_alert_status = None       # None / "no_alert" / "yellow" / "red" / "active"
+alert_start_time = None
+boryspil_target_sent = False   # чи було повідомлення про загрозу Борисполю
+recent_messages = []           # для дедуплікації
 
 
 def kyiv_now():
     return datetime.now(KYIV_TZ).replace(tzinfo=None)
 
 
-# Історія тривог
+# ---------- Обробка тексту ----------
+def contains_phrase(text, phrase):
+    pattern = r"(?<!\w)" + re.escape(phrase).replace(r"\ ", r"\s+") + r"(?!\w)"
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+
+def has_any(text, words):
+    return any(contains_phrase(text, w) for w in words)
+
+
+def normalize(text):
+    text = re.sub(r"@\w+", " ", text.lower())
+    text = re.sub(r"[^\w\s]", " ", text)
+    return set(text.split())
+
+
+def clean_message(text):
+    text = text.replace("🛵", "")
+    text = re.sub(r"@\w+", "", text)  # прибираємо підписи каналів
+    text = re.sub(r"[ \t]+", " ", text)
+    lines = [line.strip() for line in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+# рядок-пункт списку: на початку (після емодзі/символів) число або "біля/на/до/..."
+LIST_LINE = re.compile(
+    r"^\W*(?:\d+\s+|(?:біля|в бік|у бік|на|до|курсом?|летить|рухається|напрям\w*)\b)",
+    flags=re.IGNORECASE,
+)
+
+
+def keep_boryspil_lines(message):
+    """Якщо повідомлення — список напрямків, лишає тільки рядки про Бориспіль."""
+    lines = [line for line in message.splitlines() if line.strip()]
+
+    if sum(bool(LIST_LINE.match(line)) for line in lines) < 2:
+        return message  # не список — лишаємо як є
+
+    targets = [i for i, line in enumerate(lines) if has_any(line, BORYSPIL_WORDS)]
+    if not targets:
+        return ""
+
+    first = targets[0]
+    kept = [
+        line for i, line in enumerate(lines)
+        if i in targets or (i < first and "київщина" in line.lower())
+    ]
+    return "\n".join(kept)
+
+
+def is_duplicate(tokens, now):
+    if len(tokens) < 3:
+        return False
+
+    recent_messages[:] = [m for m in recent_messages if now - m["time"] <= DEDUP_WINDOW]
+    directions = tokens & DIRECTIONS
+
+    for item in recent_messages:
+        old = item["tokens"]
+        old_directions = old & DIRECTIONS
+
+        if directions and old_directions and directions != old_directions:
+            continue  # різні напрямки — не дубль
+
+        shared = tokens & old
+        if len(shared) >= 3 and len(shared) / len(tokens | old) >= 0.72:
+            return True
+
+    return False
+
+
+# ---------- Історія тривог ----------
 def load_alert_history():
     if not os.path.exists(ALERT_HISTORY_FILE):
         return []
-
     try:
-        with open(ALERT_HISTORY_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
+        with open(ALERT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception as e:
         print(f"⚠️ Не вдалося завантажити історію тривог: {e}")
         return []
 
 
-def save_alert_history(history):
-    try:
-        with open(ALERT_HISTORY_FILE, "w", encoding="utf-8") as file:
-            json.dump(history, file, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Не вдалося зберегти історію тривог: {e}")
-
-
 alert_history = load_alert_history()
 
 
-def parse_alert_time(value):
-    if not value:
-        return None
-
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(KYIV_TZ).replace(tzinfo=None)
-
-
-def save_finished_alert(start_time, finish_time):
-    if start_time is None or finish_time is None:
-        return
-
-    alert_history.append({
-        "started_at": start_time.isoformat(),
-        "finished_at": finish_time.isoformat()
-    })
-
-    save_alert_history(alert_history)
-
-    print(
-        f"💾 Тривогу збережено: "
-        f"{start_time.strftime('%d.%m.%Y %H:%M')} — "
-        f"{finish_time.strftime('%d.%m.%Y %H:%M')}"
-    )
+def save_finished_alert(start, finish):
+    alert_history.append({"started_at": start.isoformat(), "finished_at": finish.isoformat()})
+    try:
+        with open(ALERT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(alert_history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Не вдалося зберегти історію тривог: {e}")
 
 
 def get_day_statistics(day):
     day_start = datetime.combine(day, datetime.min.time())
     day_end = day_start + timedelta(days=1)
     count = 0
-    total_duration = timedelta(0)
+    total = timedelta(0)
 
     for item in alert_history:
         try:
-            start_time = datetime.fromisoformat(item["started_at"])
-            finish_time = datetime.fromisoformat(item["finished_at"])
+            start = datetime.fromisoformat(item["started_at"])
+            finish = datetime.fromisoformat(item["finished_at"])
         except Exception:
             continue
 
-        if finish_time <= day_start or start_time >= day_end:
+        if finish <= day_start or start >= day_end:
             continue
 
         count += 1
-        period_start = max(start_time, day_start)
-        period_finish = min(finish_time, day_end)
-        total_duration += period_finish - period_start
+        total += min(finish, day_end) - max(start, day_start)
 
-    return count, total_duration
+    return count, total
 
 
-# Повідомлення з каналів
-@client.on(events.NewMessage(chats=channels))
+def parse_alert_time(value):
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt.astimezone(KYIV_TZ).replace(tzinfo=None)
+
+
+# ---------- Повідомлення з каналів ----------
+@client.on(events.NewMessage(chats=CHANNELS))
 async def new_message(event):
-    global last_message_time, boryspil_target_sent
+    global boryspil_target_sent
 
-    raw_text = event.raw_text or ""
-    text = raw_text.lower()
-    source_username = (event.chat.username or "").lower()
-    message_text = raw_text.replace("🛵", "")
-    message_text = re.sub(r"@operinform\b", "", message_text, flags=re.IGNORECASE)
+    raw = event.raw_text or ""
+    lowered = raw.lower()
 
-    if source_username:
-        message_text = re.sub(
-            rf"@{re.escape(source_username)}\b",
-            "",
-            message_text,
-            flags=re.IGNORECASE
-        )
-
-    message_text = re.sub(r"(?m)^\s*@\w+\s*$", "", message_text)
-    message_text = re.sub(r"[ \t]+", " ", message_text)
-    message_text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", message_text).strip()
-
-    print(f"📨 Нове повідомлення | {kyiv_now().strftime('%H:%M:%S')}")
-
-    if any(contains_phrase(text, word) for word in IGNORE_WORDS):
-        print("⏭️ Повідомлення пропущено — ігнорований зміст")
-        return
-
-    is_boryspil = any(contains_phrase(text, word) for word in BORYSPIL_WORDS)
-
-    is_recon = (
-        "область дорозвідка" in text
-        and last_alert_status in ["yellow", "red", "active"]
-        and boryspil_target_sent
-    )
-
-    if "область дорозвідка" in text and not is_recon:
-        print("⏭️ Дорозвідка пропущена — немає активної локальної тривоги")
-        return
-
-    if not (is_boryspil or is_recon):
-        return
-
-    if is_boryspil and not is_recon:
-        message_text, was_filtered = filter_boryspil_directions(message_text)
-
-        if was_filtered and not message_text:
-            print("⏭️ Повідомлення пропущено — немає потрібних напрямків")
+    # Дорозвідка — тільки під час тривоги, після повідомлення про Бориспіль
+    is_recon = "область дорозвідка" in lowered
+    if is_recon:
+        if not (boryspil_target_sent and last_alert_status in STATUS_TEXT):
             return
-
-    if not message_text:
+    elif not has_any(lowered, BORYSPIL_WORDS):
         return
 
-    word_count = len(re.findall(r"\b[\w’'-]+\b", message_text, flags=re.UNICODE))
-    has_urgent_term = any(term in text for term in URGENT_TERMS)
+    message = clean_message(raw)
+    if not is_recon:
+        message = keep_boryspil_lines(message)
 
-    if is_boryspil and not is_recon and word_count > 20 and not has_urgent_term:
-        print(f"⏭️ Повідомлення пропущено — {word_count} слів, немає термінового маркера")
+    # Ігнор перевіряємо вже після фільтра, щоб один "чужий" рядок не глушив увесь список
+    if not message or has_any(message.lower(), IGNORE_WORDS):
         return
 
     now = kyiv_now()
+    tokens = normalize(message)
 
-    # Перевірка та резервування повідомлення
-    async with message_lock:
-        if is_duplicate_message(message_text, now):
-            print("⏭️ Дублікат пропущено — схоже повідомлення вже надіслано")
-            return
+    if is_duplicate(tokens, now):
+        print("⏭️ Дублікат пропущено")
+        return
 
-        if not is_recon and last_message_time and now - last_message_time < COOLDOWN:
-            print("⏳ Повідомлення пропущено — ще не минуло 60 секунд")
-            return
+    entry = {"time": now, "tokens": tokens}
+    recent_messages.append(entry)
 
-        previous_last_message_time = last_message_time
-        reservation = {"time": now, "normalized": normalize_message(message_text)}
-        recent_forwarded_messages.append(reservation)
-
-        if not is_recon:
-            last_message_time = now
-
-    if is_boryspil:
-        print("📍 ЗНАЙДЕНО ЦІЛЬ НА БОРИСПІЛЬ!")
-
-    if is_recon:
-        print("🟡 ЗНАЙДЕНО ДОРОЗВІДКУ!")
-
-    print(message_text)
-    print("-" * 40)
-
-    # Надсилання без підпису каналу-джерела
     try:
-        await client.send_message(target_channel, message_text, silent=is_recon)
+        await client.send_message(TARGET_CHANNEL, message, silent=is_recon)
     except Exception as e:
-        async with message_lock:
-            recent_forwarded_messages[:] = [
-                item for item in recent_forwarded_messages if item is not reservation
-            ]
-
-            if not is_recon and last_message_time == now:
-                last_message_time = previous_last_message_time
-
+        recent_messages.remove(entry)
         print(f"⚠️ Не вдалося надіслати повідомлення: {e}")
         return
 
-    if is_boryspil:
+    if not is_recon:
         boryspil_target_sent = True
 
-    print("📤 ПОВІДОМЛЕННЯ НАДІСЛАНО")
+    print(f"📤 Надіслано ({'дорозвідка' if is_recon else 'Бориспіль'}) | {now:%H:%M:%S}")
+    print(message)
     print("-" * 40)
 
 
-# Alerts.in.ua
+# ---------- alerts.in.ua ----------
 async def get_boryspil_alert(session):
     url = "https://api.alerts.in.ua/v1/alerts/active.json"
-    headers = {"Authorization": f"Bearer {alerts_token}"}
+    headers = {"Authorization": f"Bearer {ALERTS_TOKEN}"}
 
     async with session.get(url, headers=headers) as response:
         if response.status != 200:
-            try:
-                error_data = await response.json()
-                error_message = error_data.get("message", "Невідома помилка")
-            except Exception:
-                error_message = "Невідома помилка"
-
-            raise Exception(f"API HTTP {response.status}: {error_message}")
-
+            raise Exception(f"API HTTP {response.status}")
         data = await response.json()
 
-    alerts = data.get("alerts", [])
+    for alert in data.get("alerts", []):
+        if str(alert.get("location_uid")) == BORYSPIL_RAION_UID and alert.get("alert_type") == "air_raid":
+            return alert
 
-    boryspil_alerts = [
-        alert for alert in alerts
-        if str(alert.get("location_uid")) == BORYSPIL_RAION_UID
-        and alert.get("alert_type") == "air_raid"
-    ]
-
-    if not boryspil_alerts:
-        return None
-
-    return boryspil_alerts[0]
+    return None
 
 
-# Ранкова статистика
-async def daily_statistics():
-    while True:
-        try:
-            now = kyiv_now()
-            report_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
-
-            if now >= report_time:
-                report_time += timedelta(days=1)
-
-            seconds_until_report = (report_time - now).total_seconds()
-            await asyncio.sleep(seconds_until_report)
-
-            previous_day = (kyiv_now() - timedelta(days=1)).date()
-            months = [
-                "січня", "лютого", "березня", "квітня", "травня", "червня",
-                "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"
-            ]
-            date_text = f"{previous_day.day} {months[previous_day.month - 1]}"
-
-            alert_count, alert_duration = get_day_statistics(previous_day)
-            total_seconds = int(alert_duration.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-
-            if alert_start_time is not None:
-                if last_alert_status == "yellow":
-                    current_status = "🟡 Триває жовта тривога"
-                elif last_alert_status == "red":
-                    current_status = "🔴 Триває червона тривога"
-                else:
-                    current_status = "⚠️ Тривога триває"
-            else:
-                current_status = "🟢 Спокійно"
-
-            message = (
-                "<b>☀️ Доброго ранку!</b>\n\n"
-                f"<b>📊 Статистика за {date_text}:</b>\n"
-                f"🚨 Тривог: <b>{alert_count}</b>\n"
-                f"⏱ Загальна тривалість у Бориспільському районі: "
-                f"<b>{hours} год {minutes} хв</b>\n\n"
-                f"Наразі: <b>{current_status}</b>\n\n"
-                f"📡 {channel_link}"
-            )
-
-            await client.send_message(
-                target_channel,
-                message,
-                parse_mode="html",
-                silent=True,
-                link_preview=False
-            )
-
-            print(
-                f"📊 Ранкова статистика надіслана: "
-                f"{alert_count} тривог, "
-                f"{hours} год {minutes} хв"
-            )
-
-        except Exception as e:
-            print(f"⚠️ Помилка статистики дня: {e}")
-
-
-# Моніторинг тривог
 async def monitor_alerts():
-    global last_alert_status, alert_start_time, boryspil_target_sent, last_message_time
+    global last_alert_status, alert_start_time, boryspil_target_sent
 
     timeout = aiohttp.ClientTimeout(total=5)
 
@@ -460,119 +282,109 @@ async def monitor_alerts():
                 alert = await get_boryspil_alert(session)
 
                 if alert is None:
-                    current_status = "no_alert"
+                    status = "no_alert"
+                elif alert.get("alert_level") in ("yellow", "red"):
+                    status = alert["alert_level"]
                 else:
-                    alert_level = alert.get("alert_level")
-
-                    if alert_level == "yellow":
-                        current_status = "yellow"
-                    elif alert_level == "red":
-                        current_status = "red"
-                    else:
-                        current_status = "active"
+                    status = "active"
 
                 if last_alert_status is None:
-                    last_alert_status = current_status
+                    # перший запуск — просто запам'ятовуємо стан
+                    last_alert_status = status
+                    if alert:
+                        alert_start_time = parse_alert_time(alert.get("started_at")) or kyiv_now()
+                    print(f"🚨 Початковий статус: {status}")
 
-                    print(f"🚨 alerts.in.ua | Початковий статус: {current_status}")
+                elif status != last_alert_status:
+                    print(f"🚨 {last_alert_status} → {status}")
 
-                    if alert is not None:
-                        started_at = alert.get("started_at")
-                        alert_start_time = parse_alert_time(started_at)
-
-                        if alert_start_time:
-                            print(f"🕐 Початок поточної тривоги: {alert_start_time}")
-
-                    print("-" * 40)
-
-                elif current_status != last_alert_status:
-                    last_message_time = None
-
-                    print(f"🚨 alerts.in.ua | {last_alert_status} → {current_status}")
-
-                    if last_alert_status == "no_alert" and current_status in ["yellow", "red", "active"]:
-                        print("🚨 ПОЧАТОК ПОВІТРЯНОЇ ТРИВОГИ!")
-
-                        if alert:
-                            started_at = alert.get("started_at")
-                            alert_start_time = parse_alert_time(started_at)
-
-                            if alert_start_time:
-                                print(f"🕐 Початок тривоги: {alert_start_time}")
-
-                    if current_status == "yellow":
-                        print("🟡 ЖОВТИЙ РІВЕНЬ ПОВІТРЯНОЇ ТРИВОГИ!")
-
-                        await client.send_message(
-                            target_channel,
-                            "<b>🟡 Повітряна тривога!</b>\n<i>Жовтий рівень!</i>",
-                            parse_mode="html"
-                        )
-
-                    elif current_status == "red":
-                        print("🔴 ЧЕРВОНИЙ РІВЕНЬ ПОВІТРЯНОЇ ТРИВОГИ!")
-
-                        await client.send_message(
-                            target_channel,
-                            "<b>🔴 Повітряна тривога!</b>\n<i>Червоний рівень!</i>",
-                            parse_mode="html"
-                        )
-
-                    elif current_status == "active":
-                        print("⚠️ Активна тривога, але рівень не визначений")
-
-                    elif current_status == "no_alert":
-                        print("🟢 ВІДБІЙ ПОВІТРЯНОЇ ТРИВОГИ!")
-
+                    if status == "no_alert":
+                        finished_at = kyiv_now()
                         duration_text = ""
 
                         if alert_start_time:
-                            finished_at = kyiv_now()
-                            duration = finished_at - alert_start_time
-                            total_seconds = int(duration.total_seconds())
-                            hours = total_seconds // 3600
-                            minutes = (total_seconds % 3600) // 60
-
+                            minutes_total = int((finished_at - alert_start_time).total_seconds() // 60)
+                            hours, minutes = divmod(minutes_total, 60)
                             if hours:
                                 duration_text = f"\n⏱ Тривалість: {hours} год {minutes} хв"
                             else:
                                 duration_text = f"\n⏱ Тривалість: {minutes} хв"
 
-                            print(f"⏱ Тривалість тривоги: {hours} год {minutes} хв")
-                            save_finished_alert(alert_start_time, finished_at)
-                        else:
-                            print("⚠️ Час початку тривоги не збережений")
-
                         await client.send_message(
-                            target_channel,
+                            TARGET_CHANNEL,
                             "<b>🟢 Відбій повітряної тривоги!</b>" + duration_text,
-                            parse_mode="html"
+                            parse_mode="html",
                         )
+
+                        # зберігаємо тільки ПІСЛЯ успішного надсилання (щоб не було дублів)
+                        if alert_start_time:
+                            save_finished_alert(alert_start_time, finished_at)
 
                         alert_start_time = None
                         boryspil_target_sent = False
 
-                    last_alert_status = current_status
+                    else:
+                        if last_alert_status == "no_alert":
+                            alert_start_time = parse_alert_time(alert.get("started_at")) or kyiv_now()
+
+                        await client.send_message(TARGET_CHANNEL, ALERT_TEXT[status], parse_mode="html")
+
+                    last_alert_status = status
 
             except Exception as e:
-                print(f"⚠️ Помилка alerts.in.ua: {e}")
+                print(f"⚠️ Помилка моніторингу тривог: {e}")
 
-            await asyncio.sleep(6)
+            await asyncio.sleep(POLL_SECONDS)
 
 
-# Запуск
-client.start()
+# ---------- Ранкова статистика ----------
+async def daily_statistics():
+    while True:
+        now = kyiv_now()
+        report_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+        if now >= report_time:
+            report_time += timedelta(days=1)
+
+        # +1 секунда, щоб після пробудження вже точно було після 08:00 (без подвійної відправки)
+        await asyncio.sleep((report_time - now).total_seconds() + 1)
+
+        try:
+            day = (kyiv_now() - timedelta(days=1)).date()
+            count, duration = get_day_statistics(day)
+            total_minutes = int(duration.total_seconds() // 60)
+            hours, minutes = divmod(total_minutes, 60)
+
+            current = STATUS_TEXT.get(last_alert_status, "🟢 Спокійно")
+
+            message = (
+                "<b>☀️ Доброго ранку!</b>\n\n"
+                f"<b>📊 Статистика за {day.day} {MONTHS[day.month - 1]}:</b>\n"
+                f"🚨 Тривог: <b>{count}</b>\n"
+                f"⏱ Загальна тривалість у Бориспільському районі: <b>{hours} год {minutes} хв</b>\n\n"
+                f"Наразі: <b>{current}</b>\n\n"
+                f"📡 {CHANNEL_LINK}"
+            )
+
+            await client.send_message(
+                TARGET_CHANNEL, message, parse_mode="html", silent=True, link_preview=False
+            )
+            print(f"📊 Статистика надіслана: {count} тривог, {hours} год {minutes} хв")
+
+        except Exception as e:
+            print(f"⚠️ Помилка статистики дня: {e}")
+
+
+# ---------- Запуск ----------
+client.start()  # акаунт користувача (сесія monitor_session) — бот-токен не бачить чужі канали
 
 print("=" * 40)
 print("🟢 БОТ ЗАПУЩЕНИЙ")
-print(f"Час запуску: {kyiv_now().strftime('%d.%m.%Y %H:%M:%S')}")
-print("📡 Моніторимо канали:")
-print(channels)
-print(f"📨 Повідомлення надсилаються у: {target_channel}")
-print("🚨 alerts.in.ua: Бориспільський район (UID 78)")
-print(f"💾 Історія тривог: {ALERT_HISTORY_FILE}")
+print(f"Час запуску: {kyiv_now():%d.%m.%Y %H:%M:%S}")
+print(f"📡 Канали: {CHANNELS}")
+print(f"📨 Надсилаємо у: {TARGET_CHANNEL}")
 print("=" * 40)
 
 client.loop.create_task(daily_statistics())
 client.loop.create_task(monitor_alerts())
 client.run_until_disconnected()
+
