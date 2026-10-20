@@ -1,0 +1,7 @@
+.env
+*.session
+*.session-journal
+alert_history.json
+qr.png
+__pycache__/
+venv/

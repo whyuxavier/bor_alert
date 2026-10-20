@@ -1,0 +1,14 @@
+[Unit]
+Description=Boryspil monitor bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=opc
+WorkingDirectory=/home/opc/bot
+ExecStart=/home/opc/bot/venv/bin/python -u bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
