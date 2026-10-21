@@ -28,6 +28,8 @@ BORYSPIL_RAION_UID = "78"
 ALERT_HISTORY_FILE = os.path.join(DATA_DIR, "alert_history.json")
 POLL_SECONDS = 6
 DEDUP_WINDOW = timedelta(seconds=150)
+FORWARD_COOLDOWN = timedelta(seconds=45)
+last_forward_time = None   # час останнього пересланого повідомлення про Бориспіль
 
 CHANNEL_LINK = '<a href="https://t.me/bor_alert">Бориспіль | Монітор</a>'
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -208,7 +210,7 @@ def parse_alert_time(value):
 # ---------- Повідомлення з каналів ----------
 @client.on(events.NewMessage(chats=CHANNELS))
 async def new_message(event):
-    global boryspil_target_sent
+    global boryspil_target_sent, last_forward_time
 
     raw = event.raw_text or ""
     lowered = raw.lower()
@@ -235,6 +237,10 @@ async def new_message(event):
     if is_duplicate(tokens, now):
         print("⏭️ Дублікат пропущено")
         return
+    
+    if not is_recon and last_forward_time and now - last_forward_time < FORWARD_COOLDOWN:
+        print("⏳ Кулдаун, пропущено")
+        return
 
     entry = {"time": now, "tokens": tokens}
     recent_messages.append(entry)
@@ -248,6 +254,7 @@ async def new_message(event):
 
     if not is_recon:
         boryspil_target_sent = True
+        last_forward_time = now
 
     print(f"📤 Надіслано ({'дорозвідка' if is_recon else 'Бориспіль'}) | {now:%H:%M:%S}")
     print(message)
