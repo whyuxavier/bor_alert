@@ -16,7 +16,7 @@ load_dotenv()
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 ALERTS_TOKEN = os.environ["ALERTS_TOKEN"]
-TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "bor_alert") 
+TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "bor_alert")
 
 # Папка з сесією та історією тривог (поза репозиторієм)
 DATA_DIR = os.environ.get("DATA_DIR", ".")
@@ -44,6 +44,19 @@ IGNORE_WORDS = [
     "бориспільський район", "бориспільського району", "бориспільському районі",
     "бориспільводоканал", "планові роботи", "багринова", "чорна", "батиєва",
 ]
+
+# Заголовки блоків, які стосуються Київщини (решта областей у списку відкидається)
+KYIV_REGION_WORDS = [
+    "київщина", "київщини", "київщину",
+    "київська область", "київської області",
+    "бориспільський район",
+]
+
+BULLET = re.compile(r"^\s*[-–—•*▪●▶►➡]")
+REGION_HEADER = re.compile(
+    r"^\W*[^\W\d_][\w'’ʼ\- ]{2,40}?(щина|ччина|щини|область|області)\W*$",
+    flags=re.IGNORECASE,
+)
 
 # Поки вимкнено (разом з обмеженням "більше 20 слів без терміну").
 # URGENT_TERMS = ["шахед", "баліст", "ракет", "крилат", "дорозвідка", "пуск", "зліт"]
@@ -105,6 +118,47 @@ def clean_message(text):
     text = re.sub(r"[ \t]+", " ", text)
     lines = [line.strip() for line in text.splitlines()]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def fix_place_names(text):
+    """Виправляє регістр відстежуваних назв: бориспіль → Бориспіль."""
+    for word in BORYSPIL_WORDS:
+        pattern = r"(?<!\w)" + re.escape(word).replace(r"\ ", r"\s+") + r"(?!\w)"
+        text = re.sub(
+            pattern,
+            lambda m: " ".join(w.capitalize() for w in m.group(0).split()),
+            text,
+            flags=re.IGNORECASE,
+        )
+    return text
+
+
+def is_region_header(line):
+    """Рядок-заголовок області (Київщина, Хмельниччина, ... область), не пункт списку."""
+    return not BULLET.match(line) and REGION_HEADER.match(line.strip()) is not None
+
+
+def keep_kyiv_sections(message):
+    """Якщо повідомлення поділене на області, лишає тільки блок(и) Київщини."""
+    lines = message.splitlines()
+    headers = [i for i, line in enumerate(lines) if line.strip() and is_region_header(line)]
+
+    if len(headers) < 2:
+        return message  # одна область або взагалі без поділу — лишаємо як є
+
+    kept = lines[:headers[0]]  # вступ до першого заголовка
+    found = False
+
+    for n, start in enumerate(headers):
+        end = headers[n + 1] if n + 1 < len(headers) else len(lines)
+        if has_any(lines[start].lower(), KYIV_REGION_WORDS):
+            kept += lines[start:end]
+            found = True
+
+    if not found:
+        return message  # блоку Київщини немає — нічого не ріжемо
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
 
 
 # рядок-пункт списку: на початку (після емодзі/символів) число або "біля/на/до/..."
@@ -224,8 +278,10 @@ async def new_message(event):
         return
 
     message = clean_message(raw)
+    message = fix_place_names(message)
     if not is_recon:
-        message = keep_boryspil_lines(message)
+        message = keep_kyiv_sections(message)   # спершу відкидаємо інші області
+        message = keep_boryspil_lines(message)  # потім фільтруємо списки напрямків
 
     # Ігнор перевіряємо вже після фільтра, щоб один "чужий" рядок не глушив увесь список
     if not message or has_any(message.lower(), IGNORE_WORDS):
@@ -237,7 +293,7 @@ async def new_message(event):
     if is_duplicate(tokens, now):
         print("⏭️ Дублікат пропущено")
         return
-    
+
     if not is_recon and last_forward_time and now - last_forward_time < FORWARD_COOLDOWN:
         print("⏳ Кулдаун, пропущено")
         return
@@ -394,4 +450,3 @@ print("=" * 40)
 client.loop.create_task(daily_statistics())
 client.loop.create_task(monitor_alerts())
 client.run_until_disconnected()
-
