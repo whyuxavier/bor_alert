@@ -26,7 +26,7 @@ CHANNELS = ["operinform", "war_monitor", "eRadarrua", "kyiv_nebo", "kyiv_airdef"
 
 BORYSPIL_RAION_UID = "78"
 ALERT_HISTORY_FILE = os.path.join(DATA_DIR, "alert_history.json")
-POLL_SECONDS = 6
+POLL_SECONDS = 7
 DEDUP_WINDOW = timedelta(seconds=150)
 FORWARD_COOLDOWN = timedelta(seconds=45)
 last_forward_time = None   # час останнього пересланого повідомлення про Бориспіль
@@ -42,7 +42,7 @@ BORYSPIL_WORDS = [
 
 IGNORE_WORDS = [
     "бориспільський район", "бориспільського району", "бориспільському районі",
-    "бориспільводоканал", "планові роботи", "багринова", "чорна", "батиєва",
+    "бориспільводоканал", "планові роботи", "багринова", "чорна", "батиєва", "яр",
 ]
 
 # Заголовки блоків, які стосуються Київщини (решта областей у списку відкидається)
@@ -58,15 +58,16 @@ REGION_HEADER = re.compile(
     flags=re.IGNORECASE,
 )
 
-# Поки вимкнено (разом з обмеженням "більше 20 слів без терміну").
-# URGENT_TERMS = ["шахед", "баліст", "ракет", "крилат", "дорозвідка", "пуск", "зліт"]
-
 DIRECTIONS = {
     "північ", "півночі", "північний", "північного",
     "південний", "південь", "півдня", "південного",
     "схід", "сходу", "східний", "східного",
     "захід", "заходу", "західний", "західного",
 }
+
+# Спеціальні фрази, які відстежуються лише під час червоної тривоги
+BALLISTIC_PHRASE = "загроза балістики"
+NO_FIXATION_PHRASE = "без фіксації"
 
 ALERT_TEXT = {
     "yellow": "<b>🟡 Повітряна тривога!</b>\n<i>Жовтий рівень!</i>",
@@ -90,6 +91,10 @@ last_alert_status = None       # None / "no_alert" / "yellow" / "red" / "active"
 alert_start_time = None
 boryspil_target_sent = False   # чи було повідомлення про загрозу Борисполю
 recent_messages = []           # для дедуплікації
+
+# По одному повідомленню кожного типу на цикл тривоги
+ballistic_threat_sent = False
+no_fixation_sent = False
 
 
 def kyiv_now():
@@ -265,9 +270,54 @@ def parse_alert_time(value):
 @client.on(events.NewMessage(chats=CHANNELS))
 async def new_message(event):
     global boryspil_target_sent, last_forward_time
+    global ballistic_threat_sent, no_fixation_sent
 
     raw = event.raw_text or ""
     lowered = raw.lower()
+
+    # Спеціальні повідомлення обробляємо ДО фільтрів Борисполя.
+    # Якщо фраза є, звичайна пересилка цього повідомлення не запускається.
+    is_ballistic = contains_phrase(lowered, BALLISTIC_PHRASE)
+    is_no_fixation = contains_phrase(lowered, NO_FIXATION_PHRASE)
+
+    if is_ballistic or is_no_fixation:
+        if last_alert_status != "red":
+            print("⏭️ Спеціальна фраза пропущена: немає активної червоної тривоги")
+            return
+
+        # «Загроза балістики»: лише перше повідомлення за цикл червоної тривоги.
+        if is_ballistic and not ballistic_threat_sent:
+            message = clean_message(raw)
+            try:
+                await client.send_message(TARGET_CHANNEL, message)
+            except Exception as e:
+                print(f"⚠️ Не вдалося надіслати повідомлення про балістику: {e}")
+                return
+
+            ballistic_threat_sent = True
+            print(f"📤 Надіслано повідомлення про загрозу балістики | {kyiv_now():%H:%M:%S}")
+            print(message)
+            print("-" * 40)
+            return
+
+        # «Без фіксації»: лише після успішно надісланого повідомлення про балістику
+        # і лише один раз за цей самий цикл червоної тривоги.
+        if is_no_fixation and ballistic_threat_sent and not no_fixation_sent:
+            message = clean_message(raw)
+            try:
+                await client.send_message(TARGET_CHANNEL, message)
+            except Exception as e:
+                print(f"⚠️ Не вдалося надіслати повідомлення «без фіксації»: {e}")
+                return
+
+            no_fixation_sent = True
+            print(f"📤 Надіслано повідомлення «без фіксації» | {kyiv_now():%H:%M:%S}")
+            print(message)
+            print("-" * 40)
+            return
+
+        print("⏭️ Спеціальне повідомлення пропущено: умову вже використано або ще не виконано")
+        return
 
     # Дорозвідка — тільки під час тривоги, після повідомлення про Бориспіль
     is_recon = "область дорозвідка" in lowered
@@ -336,6 +386,7 @@ async def get_boryspil_alert(session):
 
 async def monitor_alerts():
     global last_alert_status, alert_start_time, boryspil_target_sent
+    global ballistic_threat_sent, no_fixation_sent
 
     timeout = aiohttp.ClientTimeout(total=5)
 
@@ -385,6 +436,10 @@ async def monitor_alerts():
 
                         alert_start_time = None
                         boryspil_target_sent = False
+
+                        # Новий цикл після відбою: обидві спеціальні фрази знову дозволені.
+                        ballistic_threat_sent = False
+                        no_fixation_sent = False
 
                     else:
                         if last_alert_status == "no_alert":
