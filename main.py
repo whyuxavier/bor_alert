@@ -66,7 +66,7 @@ DIRECTIONS = {
 }
 
 # Спеціальні фрази, які відстежуються лише під час червоної тривоги
-BALLISTIC_PHRASE = "загроза балістики"
+BALLISTIC_PHRASE = "загроза балістики з"
 NO_FIXATION_PHRASE = "без фіксації"
 
 ALERT_TEXT = {
