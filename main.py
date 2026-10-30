@@ -119,6 +119,7 @@ def normalize(text):
 
 def clean_message(text):
     text = text.replace("🛵", "")
+    text = text.replace("🚛","")
     text = re.sub(r"@\w+", "", text)  # прибираємо підписи каналів
     text = re.sub(r"[ \t]+", " ", text)
     lines = [line.strip() for line in text.splitlines()]
